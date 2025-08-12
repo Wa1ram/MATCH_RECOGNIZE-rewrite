@@ -3,9 +3,12 @@ from helper.python_trino_parser import sql_to_clauses
 import re
 import sys
 import textwrap
+from typing import Any, Iterable, Iterator, Sequence, List, Tuple, Set, Optional, Pattern, Union
+
+NestedStrList = Sequence[Union[str, 'NestedStrList']]
 
 
-def flatten(lst):
+def flatten(lst: Iterable[Any]) -> Iterator[Any]:
     # Recursively flatten a nested list
     for el in lst:
         if isinstance(el, list):
@@ -14,19 +17,24 @@ def flatten(lst):
             yield el
 
 
-def extract_pattern_symbols(pattern, define):
+def extract_pattern_symbols(
+    pattern: NestedStrList,
+    define: Sequence[Tuple[str, Sequence[str]]],
+) -> Tuple[Set[str], Set[str]]:
     all_sym = set(el for el in flatten(pattern) if el.isalpha() and el != 'PERMUTE')
     def_sym = set(clause[0] for clause in define)
     return all_sym, def_sym
 
     
-    
-def decompose_pattern(pattern):
+def decompose_pattern(pattern: NestedStrList) -> List[Sequence[str]]:
     pass    
     
     
-def build_window_condition_regex(first_sym, last_sym, order_by):
-    
+def build_window_condition_regex(first_sym: str, last_sym: str, order_by: str) -> Pattern[str]:
+    """
+    Compile a regex matching '<last>.<order_by> - <first>.<order_by> <= <window>'.
+    Supports INTERVAL 'n' UNIT or plain 'n UNIT'; captures the window as group 'window'.
+    """
     pattern_str = rf"""
         ^\s*
         ({last_sym})\.{re.escape(order_by)}
@@ -36,7 +44,7 @@ def build_window_condition_regex(first_sym, last_sym, order_by):
         (?P<window>
             (?:INTERVAL\s+['"]?\d+(?:\.\d+)?['"]?\s+\w+)
             |
-            (?:\d+(?:\.\d+)?\s*\w+)
+            (?:\d+(?:\.\d+)?\s*\w*)
         )
         \s*$
     """
@@ -44,7 +52,15 @@ def build_window_condition_regex(first_sym, last_sym, order_by):
 
 
 
-def map_symbols_to_conds(pattern, define, order_by, symbol_seq):
+def map_symbols_to_conds(
+    pattern: Sequence[str],
+    define: Sequence[Tuple[str, Sequence[str]]],
+    order_by: str,
+    symbol_seq: Sequence[str],
+) -> Tuple[List[str], Optional[str]]:
+    """
+    Build WHERE conditions for a chosen symbol sequence and extract the (single) window condition.
+    """
     conds = []
     
     # symbol_seq must be ordered upfront if pattern contains duplicates
@@ -56,11 +72,11 @@ def map_symbols_to_conds(pattern, define, order_by, symbol_seq):
         conds.append(f"{sym1}.{order_by} <= {sym2}.{order_by}")
         
     # creates dict from list of (sym, def_conds) tuples
-    define_dict = dict(define) 
+    define_dict = dict(define)
     
     window_pattern = build_window_condition_regex(pattern[0], pattern[-1], order_by)
-    window_cond = ""
-    window = ""
+    window_cond = None
+    window = None
     non_seq_syms = set(pattern).difference(symbol_seq)
     
     # filter symbol conditions
@@ -89,7 +105,8 @@ def map_symbols_to_conds(pattern, define, order_by, symbol_seq):
     return conds, window
 
 
-def extract_full_mr(query):
+def extract_full_mr(query: str) -> str:
+    """Extract the content inside MATCH_RECOGNIZE (...)."""
     pattern = r"""
     MATCH_RECOGNIZE       # match the keyword MATCH_RECOGNIZE
     \s*                   # match optional whitespace
@@ -107,15 +124,18 @@ def extract_full_mr(query):
     match = regex.search(query)
 
     if match:
-        mr_content = match.group(1).strip()
-        return mr_content
-    else:
-        print("No MATCH_RECOGNIZE clause found.")
-        sys.exit(0)
+        return match.group(1).strip()
+    print("No MATCH_RECOGNIZE clause found.")
+    sys.exit(0)
 
 
 
-def get_time_range(symbol_seq, pattern, order_by, window):
+def get_time_range(
+    symbol_seq: Sequence[str],
+    pattern: Sequence[str],
+    order_by: str,
+    window: Optional[str],
+) -> Tuple[Optional[str], Optional[str]]:
     # function from DEFINTION 3.7 (TODO might be incorrect for duplicates)
     t_s = t_e = None
     if symbol_seq[0] == pattern[0] and symbol_seq[-1] == pattern[-1]:
@@ -133,8 +153,18 @@ def get_time_range(symbol_seq, pattern, order_by, window):
     return t_s, t_e
 
 
-def build_ranges(pattern, symbol_seq, order_by, dataset_name, conds, window):
+def build_ranges(
+    pattern: Sequence[str],
+    symbol_seq: Sequence[str],
+    order_by: str,
+    dataset_name: str,
+    conds: Sequence[str],
+    window: Optional[str],
+) -> str:
+    """Create the ranges CTE based on a chosen symbol sequence and window."""
     t_s, t_e = get_time_range(symbol_seq, pattern, order_by, window)
+    if t_s is None or t_e is None:
+        raise ValueError("Cannot compute time range: insufficient endpoints or window")
     
     sym_join = ", ".join(f"{dataset_name} AS {sym}" for sym in symbol_seq)
     cond_str = "\n\tAND ".join(conds)
@@ -149,7 +179,7 @@ def build_ranges(pattern, symbol_seq, order_by, dataset_name, conds, window):
     return ranges
 
 
-def build_prefilter(dataset_name, order_by):
+def build_prefilter(dataset_name: str, order_by: str) -> str:
     prefilter = textwrap.dedent(f"""
         prefilter AS (
             SELECT DISTINCT {dataset_name}.* FROM {dataset_name}, ranges AS r
@@ -159,13 +189,13 @@ def build_prefilter(dataset_name, order_by):
     return prefilter
 
 
-def build_query(ranges, prefilter, full_mr):
+def build_query(ranges: str, prefilter: str, full_mr: str) -> str:
     final = f"SELECT * FROM prefilter MATCH_RECOGNIZE (\n{full_mr}\n)"
     query = "".join([ranges, prefilter, final])
     return query
 
 
-def main():
+def main() -> None:
     query = textwrap.dedent("""
         SELECT * FROM Crimes
         MATCH_RECOGNIZE (
@@ -196,7 +226,12 @@ def main():
     
     # special case: pattern only has Concatenation operator, e.g., (A B C D E)
     if all(literal.isalpha() for literal in pattern_literals):
-        conds, window = map_symbols_to_conds(pattern_literals, clauses['define'], clauses['order_by'][0], symbol_seq)
+        conds, window = map_symbols_to_conds(
+            pattern_literals,
+            clauses['define'],
+            clauses['order_by'][0],
+            symbol_seq,
+        )
         
         ranges_str = build_ranges(pattern_literals, symbol_seq, clauses['order_by'][0], dataset_name, conds, window)
         prefilter_str = build_prefilter(dataset_name, clauses['order_by'][0])
@@ -210,19 +245,7 @@ def main():
         special_patterns = decompose_pattern(clauses['pattern'])
         for pattern in special_patterns:
             map_symbols_to_conds(pattern, clauses['define'], clauses['order_by'], symbol_seq)
-    
-    
-    
-    
-    all_sym, def_sym = extract_pattern_symbols(clauses['pattern'], clauses['define'])
-    
-    if not set(symbol_seq).issubset(def_sym):
-        print("All Events in the symbol_set must be defined.")
-        sys.exit(0)
-    
-    
-        
-    print()
+
     
 
 if __name__ == "__main__":

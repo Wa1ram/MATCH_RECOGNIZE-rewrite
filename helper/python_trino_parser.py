@@ -1,37 +1,52 @@
 from trino_query_parser import parse_statement
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, TypedDict
 
-# Flatten a nested list of tokens into a flat list of strings
-def flatten(nested):
+
+class MatchRecognizeClauses(TypedDict, total=False):
+    partition: List[str]
+    order_by: List[str]
+    measures: List[Tuple[str, str]]  # (expression, alias)
+    rows_per_match: str
+    after_match_skip_to: str
+    pattern: Any  # nested list/AST as returned by parser
+    define: List[Tuple[str, List[str]]]  # (variable, list of AND-split conditions)
+
+
+def flatten(nested: Sequence[Any]) -> Iterator[Any]:
+    """Yield a flat sequence of elements from a nested list-like structure."""
     for elem in nested:
         if isinstance(elem, list):
             yield from flatten(elem)
         else:
             yield elem
 
-def flatten_def_conds(nested):
+def flatten_def_conds(nested: Any) -> Iterator[str]:
+    """Split a DEFINE expression tree on AND and yield formatted condition strings."""
     if isinstance(nested, list) and len(nested) > 1 and nested[1] == 'AND':
         yield from flatten_def_conds(nested[0])
         yield from flatten_def_conds(nested[2])
     else:
         yield format_expr(nested)
 
-# Convert expression structures into readable SQL (e.g. A.price > 100)
-def format_expr(expr):
+
+def format_expr(expr: Any) -> str:
+    """Convert expression structures into readable SQL (e.g. A.price > 100)"""
     tokens = list(flatten([expr]))
     s = " ".join(tokens)
     s = s.replace(" . ", ".").replace("( ", "(").replace(" )", ")")
     s = s.replace(" ,", ",").replace(", ", ", ")
     return s
 
-def format_def_conds(expr):
+def format_def_conds(expr: Any) -> str:
     tokens = list(flatten([expr]))
     s = " ".join(tokens)
     s = s.replace(" . ", ".").replace("( ", "(").replace(" )", ")")
     s = s.replace(" ,", ",").replace(", ", ", ")
     return s
 
-# Convert a row pattern list (e.g. [['A', ['B', '+']], 'C']) into regex-like syntax
-def format_pattern(pattern):
+
+def format_pattern(pattern: Sequence[Any]) -> str:
+    """Convert a row pattern list (e.g. [['A', ['B', '+']], 'C']) into regex-like syntax"""
     parts = []
     for elem in pattern:
         if isinstance(elem, str):
@@ -46,8 +61,9 @@ def format_pattern(pattern):
             parts.append(str(elem))
     return " ".join(parts)
 
-# Recursively find the list that contains the token 'MATCH_RECOGNIZE'
-def find_match_recognize(node):
+
+def find_match_recognize(node: Any) -> Optional[List[Any]]:
+    """Depth-first search for the list that contains the literal 'MATCH_RECOGNIZE'."""
     if isinstance(node, list):
         if 'MATCH_RECOGNIZE' in node:
             return node
@@ -58,7 +74,7 @@ def find_match_recognize(node):
     return None
 
 # Given the tokens after MATCH_RECOGNIZE, extract each clause
-def extract_match_recognize(mr_tokens):
+def extract_match_recognize(mr_tokens: List[Any]) -> MatchRecognizeClauses:
     """Extract clauses from a MATCH_RECOGNIZE token list.
 
     Assumes ``mr_tokens`` is the (sub)list that includes the literal
@@ -86,7 +102,7 @@ def extract_match_recognize(mr_tokens):
     """
     idx = mr_tokens.index('MATCH_RECOGNIZE')
     i = idx + 2  # skip 'MATCH_RECOGNIZE' and '('
-    clauses = {}
+    clauses: MatchRecognizeClauses = {}
     while i < len(mr_tokens):
         tok = mr_tokens[i]
         # PARTITION BY
@@ -165,8 +181,8 @@ def extract_match_recognize(mr_tokens):
         i += 1
     return clauses
 
-def sql_to_clauses(query):
-    """High-level helper: from raw SQL with MATCH_RECOGNIZE return its clause dict.
+def sql_to_clauses(query: str) -> Tuple[str, MatchRecognizeClauses]:
+    """Parse SQL and return (dataset, MATCH_RECOGNIZE clauses).
 
     Parameters
     ----------
@@ -175,18 +191,15 @@ def sql_to_clauses(query):
 
     Returns
     -------
-    str
-        Dataset name
-    dict
-        Clause dictionary as produced by ``extract_match_recognize`` or empty
-        dict if no MATCH_RECOGNIZE is present.
-        
+    tuple[str, dict]
+        Dataset name and clause dictionary as produced by ``extract_match_recognize``.
+        Raises ValueError if no MATCH_RECOGNIZE is present.
     """
     tokens = parse_statement(query)
     mr_tokens = find_match_recognize(tokens)
-    dataset = mr_tokens[0]
     if not mr_tokens:
-        return {}
+        raise ValueError("No MATCH_RECOGNIZE clause found in SQL query")
+    dataset = mr_tokens[0]
     return dataset, extract_match_recognize(mr_tokens)
 
 

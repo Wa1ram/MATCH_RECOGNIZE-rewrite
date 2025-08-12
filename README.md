@@ -1,31 +1,66 @@
-This repository implements the logical plan rewrite rule as discussed in
-High-Performance Row Pattern Recognition Using Joins (Technical Report) by Erkang Zhu, Silu Huang and Surajit Chaudhuri.
+## MATCH_RECOGNIZE rewrite (prefilter)
 
-For further information please refer to the original work: https://www.microsoft.com/en-us/research/wp-content/uploads/2022/05/match_recognize.pdf.
+This project implements a logical rewrite inspired by “High-Performance Row Pattern Recognition Using Joins” (Technical Report) by Erkang Zhu, Silu Huang, and Surajit Chaudhuri.
 
-rewrite.py takes
-input: SQL-Query Q using MATCH-RECOGNIZE in the following format + ordered subset of pattern symbols
+It extracts constraints from a MATCH_RECOGNIZE query and constructs a prefilter (ranges + prefilter CTEs) on a chosen subset of pattern symbols. The final query runs MATCH_RECOGNIZE only on the prefiltered dataset.
 
-1 SELECT * FROM Crimes MATCH_RECOGNIZE (
-2 ORDER BY datetime
-3 MEASURES R.id AS RID, B.id AS BID,M.id AS MID,count(Z.id) AS GAP
-4 ONE ROW PER MATCH
-5 AFTER MATCH SKIP TO NEXT ROW
-6 PATTERN (R Z* B Z* M)
-7 DEFINE R AS R.primary_type = 'ROBBERY',
-8 B AS B.primary_type = 'BATTERY'
-9 AND B.lon BETWEEN R.lon - 0.05 AND R.lon + 0.05
-10 AND B.lat BETWEEN R.lat - 0.02 AND R.lat + 0.02,
-11 M AS M.primary_type = 'MOTOR VEHICLE THEFT'
-12 AND M.lon BETWEEN R.lon - 0.05 AND R.lon + 0.05
-13 AND M.lat BETWEEN R.lat - 0.02 AND R.lat + 0.02
-14 AND M.datetime - R.datetime <= INTERVAL '30' MINUTE)
+Original paper: https://www.microsoft.com/en-us/research/wp-content/uploads/2022/05/match_recognize.pdf
 
-output: restructured SQL-Query using a prefilter with the given symbol subset before MATCH-RECOGNIZE
+### Repository layout
+- `rewrite.py` — main script: builds ranges/prefilter and assembles a rewritten query.
+- `helper/python_trino_parser.py` — utilities to parse MATCH_RECOGNIZE clauses.
+- `results/` — generated queries are written here.
 
-rewrite.py follows the steps:
+### Prerequisites
+- Python 3.10+.
+- The helper imports `trino_query_parser.parse_statement`. Ensure that module is available in your environment or replace it with your own parser.
 
-1. parse PATTERN and DEFINE clauses from Q into a Dict
-2. get independent and dependent conditions for given (all) subset(s)
-3. check validity of Q (dependent conditions must be self-contained)
-4. 
+### Quick start
+`rewrite.py` contains an inline example query. Running the script generates a rewritten SQL file under `results/`, named like `<dataset>_<pattern>.`
+
+Example pattern in the script:
+
+```
+SELECT * FROM Crimes
+MATCH_RECOGNIZE (
+	ORDER BY datetime
+	MEASURES
+		R.id AS RID,
+		B.id AS BID,
+		M.id AS MID,
+		COUNT(Z.id) AS GAP
+	ONE ROW PER MATCH
+	AFTER MATCH SKIP TO NEXT ROW
+	PATTERN (R Z B Z M)
+	DEFINE
+		R AS R.primary_type = 'ROBBERY',
+		B AS B.primary_type = 'BATTERY' AND ...,
+		M AS M.primary_type = 'MOTOR VEHICLE THEFT' AND ...
+)
+```
+
+The script chooses a symbol subsequence (e.g., `['R','B']`) and produces:
+
+```
+WITH ranges AS (...),
+prefilter AS (...)
+SELECT * FROM prefilter MATCH_RECOGNIZE (...)
+```
+
+### How it works (high level)
+1. Parse the MATCH_RECOGNIZE block (PATTERN, DEFINE, ORDER BY).
+2. Extract symbol conditions and detect a single window condition (if present).
+3. Compute a time range `[t_s, t_e]` based on the chosen symbol subsequence and the window.
+4. Build a `ranges` CTE and a `prefilter` CTE using the derived WHERE clauses.
+5. Attach the original MATCH_RECOGNIZE to `prefilter`.
+
+### Customize
+- Change `symbol_seq` in `rewrite.py` to the symbol subsequence you want to prefilter on.
+- Replace the inline `query` with your own MATCH_RECOGNIZE query.
+
+### Limitations
+- Currently targets concatenation-only patterns (e.g., `(A B C)`); general decomposition (`decompose_pattern`) is not implemented yet.
+- Detects at most one window condition; INTERVAL form or plain numeric are supported.
+
+### Notes
+This repository focuses on query construction. It does not execute SQL against a database; generated queries are written to `results/` for inspection or downstream execution.
