@@ -42,14 +42,53 @@ def build_window_condition_regex(first_sym: str, last_sym: str, order_by: str) -
         ({first_sym})\.{re.escape(order_by)}
         \s*<=\s*
         (?P<window>
-            (?:INTERVAL\s+['"]?\d+(?:\.\d+)?['"]?\s+\w+)
+            (?:INTERVAL\s+['"]?-?\d+(?:\.\d+)?['"]?\s+\w+)
             |
-            (?:\d+(?:\.\d+)?\s*\w*)
+            (?:-?\d+(?:\.\d+)?\s*\w*)
         )
         \s*$
     """
     return re.compile(pattern_str, re.VERBOSE | re.IGNORECASE)
 
+
+def add_symbol_prefix(cond: str, symbol: str) -> str:
+    """
+    Add a symbol prefix (e.g., A.) to all column names in a MATCH_RECOGNIZE DEFINE condition.
+    Does not add prefix to SQL keywords, numeric literals, or function names.
+    
+    Parameters:
+        cond (str): The condition string from DEFINE.
+        symbol (str): The symbol to prefix column names with (e.g., 'A').
+    
+    Returns:
+        str: The condition with prefixed column names.
+    """
+    # SQL keywords to ignore
+    sql_keywords = {
+        "AND", "OR", "NOT", "NULL", "IS", "IN", "LIKE", "BETWEEN",
+        "CASE", "WHEN", "THEN", "ELSE", "END", "TRUE", "FALSE"
+    }
+
+    # Only add prefix if symbol is not already present
+    if not re.search(rf"\b{re.escape(symbol)}\.", cond):
+        def add_prefix(match):
+            word = match.group(0)
+            # Skip SQL keywords
+            if word.upper() in sql_keywords:
+                return word
+            # Skip numeric literals
+            if re.fullmatch(r"\d+(\.\d+)?", word):
+                return word
+            # Skip function names (directly followed by '(')
+            start = match.end()
+            if start < len(cond) and cond[start] == '(':
+                return word
+            # Otherwise, add symbol prefix
+            return f"{symbol}.{word}"
+
+        cond = re.sub(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", add_prefix, cond)
+
+    return cond
 
 
 def map_symbols_to_conds(
@@ -76,8 +115,13 @@ def map_symbols_to_conds(
     
     window_pattern = build_window_condition_regex(pattern[0], pattern[-1], order_by)
     window_cond = None
-    window = None
+    window: Optional[str] = None
     non_seq_syms = set(pattern).difference(symbol_seq)
+    
+    # you can express window funcs through adjusting the pattern
+    # eg. change    PATTERN (A)     DEFINE A AS price > PREV(price)
+    # to            PATTERN (X A)   DEFINE A AS A.price > X.price
+    win_func_pattern = re.compile(r'\b(PREV|NEXT|FIRST|LAST|LAG|LEAD|FIRST_VALUE|LAST_VALUE)\b')
     
     # filter symbol conditions
     for sym, cond_list in define_dict.items():
@@ -93,6 +137,14 @@ def map_symbols_to_conds(
             # remove all conds that include symbols which are not in symbolseq
             if any(f"{non_seq_sym}." in cond for non_seq_sym in non_seq_syms):
                 continue
+            
+            # window functions are not allowed due to difficult translation (TODO)
+            # also ensures that the conditions are self contained
+            if win_func_pattern.search(cond):
+                continue
+            
+            # converts A AS price > cost to A AS A.price > A.cost
+            cond = add_symbol_prefix(cond, sym)
             
             new_cond_list.append(cond)
         if sym in symbol_seq:
@@ -197,29 +249,25 @@ def build_query(ranges: str, prefilter: str, full_mr: str) -> str:
 
 def main() -> None:
     query = textwrap.dedent("""
-        SELECT * FROM Crimes
+        SELECT *
+        FROM stock_ticks
         MATCH_RECOGNIZE (
-            ORDER BY datetime
+            PARTITION BY symbol
+            ORDER BY ts
             MEASURES
-                R.id        AS RID,
-                B.id        AS BID,
-                M.id        AS MID,
-                COUNT(Z.id) AS GAP
-            ONE ROW PER MATCH
-            AFTER MATCH SKIP TO NEXT ROW
-            PATTERN (R Z B Z M)
+                FIRST(A.price) AS left_peak,
+                LAST(C.price)  AS right_peak,
+                AVG(B.price)   AS bottom_avg
+            ALL ROWS PER MATCH WITH UNMATCHED ROWS
+            AFTER MATCH SKIP TO FIRST C
+            PATTERN (A B C)
             DEFINE
-                R AS R.primary_type = 'ROBBERY',
-                B AS  B.primary_type = 'BATTERY'
-                     AND B.lon BETWEEN R.lon - 0.05 AND R.lon + 0.05
-                     AND B.lat BETWEEN R.lat - 0.02 AND R.lat + 0.02,
-                M AS  M.primary_type = 'MOTOR VEHICLE THEFT'
-                     AND M.lon BETWEEN R.lon - 0.05 AND R.lon + 0.05
-                     AND M.lat BETWEEN R.lat - 0.02 AND R.lat + 0.02
-                     AND M.datetime - R.datetime <= INTERVAL '30' MINUTE
-        ) AS mr
+                A AS price > cost,
+                B AS price < PREV(price),
+                C AS price > PREV(price)
+        ) AS v_shapes
         """)
-    symbol_seq = ['R', 'B']
+    symbol_seq = ['A', 'C']
     full_mr = extract_full_mr(query)
     dataset_name, clauses = sql_to_clauses(query)
     pattern_literals = list(flatten(clauses['pattern']))
