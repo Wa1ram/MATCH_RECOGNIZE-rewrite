@@ -15,37 +15,29 @@ Original paper: https://www.microsoft.com/en-us/research/wp-content/uploads/2022
 - Python 3.10+.
 - The helper imports `trino_query_parser.parse_statement`. Ensure that module is available in your environment or replace it with your own parser.
 
-### Quick start
-`rewrite.py` contains an inline example query. Running the script generates a rewritten SQL file under `results/`, named like `<dataset>_<pattern>.`
+### Usage
 
-Example pattern in the script:
-
-```
-SELECT * FROM Crimes
-MATCH_RECOGNIZE (
-	ORDER BY datetime
-	MEASURES
-		R.id AS RID,
-		B.id AS BID,
-		M.id AS MID,
-		COUNT(Z.id) AS GAP
-	ONE ROW PER MATCH
-	AFTER MATCH SKIP TO NEXT ROW
-	PATTERN (R Z B Z M)
-	DEFINE
-		R AS R.primary_type = 'ROBBERY',
-		B AS B.primary_type = 'BATTERY' AND ...,
-		M AS M.primary_type = 'MOTOR VEHICLE THEFT' AND ...
-)
-```
-
-The script chooses a symbol subsequence (e.g., `['R','B']`) and produces:
+Run the script with a mode, an input SQL file, and a symbol subsequence:
 
 ```
-WITH ranges AS (...),
-prefilter AS (...)
-SELECT * FROM prefilter MATCH_RECOGNIZE (...)
+python3 rewrite.py <mode> <input_sql_file> <SYMBOL1> [SYMBOL2 ...]
 ```
+
+Examples:
+
+- Basic prefilter
+	- `python3 rewrite.py basic input/CRIME.sql R B`
+
+- Bucketized prefilter
+	- `python3 rewrite.py bucket input/CRIME.sql R B Z M`
+
+Arguments:
+- `mode`: `basic` or `bucket`.
+- `input_sql_file`: a file containing a single MATCH_RECOGNIZE query.
+- `SYMBOL...`: ordered subsequence of pattern symbols used for the prefilter.
+
+Output:
+- Rewritten SQL is written to `results/<dataset>_<mode>_<symbols>.sql`.
 
 ### How it works (high level)
 1. Parse the MATCH_RECOGNIZE block (PATTERN, DEFINE, ORDER BY).
@@ -54,13 +46,18 @@ SELECT * FROM prefilter MATCH_RECOGNIZE (...)
 4. Build a `ranges` CTE and a `prefilter` CTE using the derived WHERE clauses.
 5. Attach the original MATCH_RECOGNIZE to `prefilter`.
 
+### Modes
+- Basic: builds ranges from ORDER BY and (optional) window; works when the pattern is concatenation-only (e.g., `(A B C)`).
+- Bucket: bucketizes input by the window size, then expands candidate buckets; requires a detectable window condition in DEFINE (e.g., `LAST.order_by - FIRST.order_by <= INTERVAL '30' MINUTE` or a plain numeric), otherwise it fails.
+
 ### Customize
-- Change `symbol_seq` in `rewrite.py` to the symbol subsequence you want to prefilter on.
-- Replace the inline `query` with your own MATCH_RECOGNIZE query.
+- Provide your own input file; pass the desired symbol subsequence on the command line.
 
 ### Limitations
-- Currently targets concatenation-only patterns (e.g., `(A B C)`); general decomposition (`decompose_pattern`) is not implemented yet.
+- Input must contain one MATCH_RECOGNIZE query.
+- Currently targets concatenation-only patterns; general decomposition (`decompose_pattern`) is not implemented yet.
 - Detects at most one window condition; INTERVAL form or plain numeric are supported.
+- Bucket mode requires a window condition; without it, no bucket rewrite is produced.
 
 ### Notes
 This repository focuses on query construction. It does not execute SQL against a database; generated queries are written to `results/` for inspection or downstream execution.

@@ -208,6 +208,34 @@ if __name__ == "__main__":
 
     queries = [
         """
+        WITH ranges AS (
+            SELECT A.TS as t_s, A.TS + INTERVAL '7' DAY as t_e
+            FROM PRICES AS A, PRICES AS B
+            WHERE A.TS <= B.TS
+            AND B.CLOSE > A.CLOSE
+            AND B.TS - A.TS <= INTERVAL '7' DAY
+            AND B.TS - A.TS <= INTERVAL '7' DAY
+        ),
+        prefilter AS (
+            SELECT DISTINCT PRICES.* FROM PRICES, ranges AS r
+            WHERE TS BETWEEN r.t_s AND r.t_e
+        )
+        SELECT * FROM prefilter MATCH_RECOGNIZE (
+        PARTITION BY symbol
+        ORDER BY ts
+        MEASURES
+            FIRST(UP.ts) AS start_ts,
+            LAST(UP.ts)  AS end_ts
+        ONE ROW PER MATCH
+        AFTER MATCH SKIP PAST LAST ROW
+        PATTERN (A B C)
+        DEFINE
+            B AS B.close > A.close
+            AND B.ts - A.ts <= INTERVAL '7' DAY,   -- Window condition
+            C AS C.close > B.close
+            AND C.ts - A.ts <= INTERVAL '7' DAY    -- Window condition vs. A
+        )""",
+        """
         SELECT * FROM Crimes
         MATCH_RECOGNIZE (
             ORDER BY datetime

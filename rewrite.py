@@ -3,9 +3,18 @@ from helper.python_trino_parser import sql_to_clauses
 import re
 import sys
 import textwrap
-from typing import Any, Iterable, Iterator, Sequence, List, Tuple, Set, Optional, Pattern, Union
+from typing import Any, Iterable, Iterator, Sequence, List, Tuple, Set, Optional, Pattern, Union, TypedDict
 
 NestedStrList = Sequence[Union[str, 'NestedStrList']]
+
+class MatchRecognizeClauses(TypedDict, total=False):
+    partition: List[str]
+    order_by: List[str]
+    measures: List[Tuple[str, str]]  # (expression, alias)
+    rows_per_match: str
+    after_match_skip_to: str
+    pattern: Any  # nested list/AST as returned by parser
+    define: List[Tuple[str, List[str]]]  # (variable, list of AND-split conditions)
 
 
 def flatten(lst: Iterable[Any]) -> Iterator[Any]:
@@ -96,19 +105,22 @@ def map_symbols_to_conds(
     define: Sequence[Tuple[str, Sequence[str]]],
     order_by: str,
     symbol_seq: Sequence[str],
+    rewrite: str = "basic"
 ) -> Tuple[List[str], Optional[str]]:
     """
     Build WHERE conditions for a chosen symbol sequence and extract the (single) window condition.
     """
     conds = []
     
+    # TODO rename duplicate events
     # symbol_seq must be ordered upfront if pattern contains duplicates
     if len(pattern) == len(set(pattern)): # contains no duplicates
         symbol_seq = sorted(symbol_seq, key=pattern.index)
     
-    # sequential conditions
-    for sym1, sym2 in zip(symbol_seq[:-1], symbol_seq[1:]):
-        conds.append(f"{sym1}.{order_by} <= {sym2}.{order_by}")
+    if rewrite == "basic":
+        # sequential conditions
+        for sym1, sym2 in zip(symbol_seq[:-1], symbol_seq[1:]):
+            conds.append(f"{sym1}.{order_by} <= {sym2}.{order_by}")
         
     # creates dict from list of (sym, def_conds) tuples
     define_dict = dict(define)
@@ -143,6 +155,7 @@ def map_symbols_to_conds(
             if win_func_pattern.search(cond):
                 continue
             
+            # TODO according to trino docs: a non-prefixed column name refers to all rows of the current match.
             # converts A AS price > cost to A AS A.price > A.cost
             cond = add_symbol_prefix(cond, sym)
             
@@ -181,8 +194,15 @@ def extract_full_mr(query: str) -> str:
     sys.exit(0)
 
 
+#####################################################
+# ************************************************* #
+#                                                   #
+#                 BASIC PREFILTER                   #
+#                                                   #
+# ************************************************* #
+#####################################################
 
-def get_time_range(
+def get_basic_time_range(
     symbol_seq: Sequence[str],
     pattern: Sequence[str],
     order_by: str,
@@ -205,7 +225,7 @@ def get_time_range(
     return t_s, t_e
 
 
-def build_ranges(
+def build_basic_ranges(
     pattern: Sequence[str],
     symbol_seq: Sequence[str],
     order_by: str,
@@ -214,12 +234,12 @@ def build_ranges(
     window: Optional[str],
 ) -> str:
     """Create the ranges CTE based on a chosen symbol sequence and window."""
-    t_s, t_e = get_time_range(symbol_seq, pattern, order_by, window)
+    t_s, t_e = get_basic_time_range(symbol_seq, pattern, order_by, window)
     if t_s is None or t_e is None:
         raise ValueError("Cannot compute time range: insufficient endpoints or window")
     
     sym_join = ", ".join(f"{dataset_name} AS {sym}" for sym in symbol_seq)
-    cond_str = "\n\tAND ".join(conds)
+    cond_str = "\n\t\tAND ".join(conds)
     
     ranges = "\n".join([
             "WITH ranges AS (",
@@ -231,7 +251,7 @@ def build_ranges(
     return ranges
 
 
-def build_prefilter(dataset_name: str, order_by: str) -> str:
+def build_basic_prefilter(dataset_name: str, order_by: str) -> str:
     prefilter = textwrap.dedent(f"""
         prefilter AS (
             SELECT DISTINCT {dataset_name}.* FROM {dataset_name}, ranges AS r
@@ -241,39 +261,24 @@ def build_prefilter(dataset_name: str, order_by: str) -> str:
     return prefilter
 
 
-def build_query(ranges: str, prefilter: str, full_mr: str) -> str:
-    final = f"SELECT * FROM prefilter MATCH_RECOGNIZE (\n{full_mr}\n)"
+def build_basic_query(ranges: str, prefilter: str, full_mr: str) -> str:
+    final = f"SELECT * FROM prefilter MATCH_RECOGNIZE (\n\t{full_mr}\n)"
     query = "".join([ranges, prefilter, final])
     return query
 
 
-def main() -> None:
-    query = textwrap.dedent("""
-        SELECT *
-        FROM stock_ticks
-        MATCH_RECOGNIZE (
-            PARTITION BY symbol
-            ORDER BY ts
-            MEASURES
-                FIRST(A.price) AS left_peak,
-                LAST(C.price)  AS right_peak,
-                AVG(B.price)   AS bottom_avg
-            ALL ROWS PER MATCH WITH UNMATCHED ROWS
-            AFTER MATCH SKIP TO FIRST C
-            PATTERN (A B C)
-            DEFINE
-                A AS price > cost,
-                B AS price < PREV(price),
-                C AS price > PREV(price)
-        ) AS v_shapes
-        """)
-    symbol_seq = ['A', 'C']
-    full_mr = extract_full_mr(query)
-    dataset_name, clauses = sql_to_clauses(query)
+def rewrite_basic(
+    clauses: MatchRecognizeClauses,
+    symbol_seq: List[str],
+    dataset_name: str,
+    full_mr: str
+    ) -> str:
+    
     pattern_literals = list(flatten(clauses['pattern']))
+    pattern = "".join(pattern_literals)
     
     # special case: pattern only has Concatenation operator, e.g., (A B C D E)
-    if all(literal.isalpha() for literal in pattern_literals):
+    if pattern.isalpha():
         conds, window = map_symbols_to_conds(
             pattern_literals,
             clauses['define'],
@@ -281,20 +286,177 @@ def main() -> None:
             symbol_seq,
         )
         
-        ranges_str = build_ranges(pattern_literals, symbol_seq, clauses['order_by'][0], dataset_name, conds, window)
-        prefilter_str = build_prefilter(dataset_name, clauses['order_by'][0])
-        new_query = build_query(ranges_str, prefilter_str, full_mr)
+        ranges: str = build_basic_ranges(pattern_literals, symbol_seq, clauses['order_by'][0], dataset_name, conds, window)
+        prefilter: str = build_basic_prefilter(dataset_name, clauses['order_by'][0])
+        new_query: str = build_basic_query(ranges, prefilter, full_mr)
         
-        os.makedirs("results", exist_ok = True)
-        with open(f"results/{dataset_name}_{pattern_literals}", "w") as out:
-            out.write(new_query)
+        
     else:   
         # decompose general pattern to special cases
         special_patterns = decompose_pattern(clauses['pattern'])
         for pattern in special_patterns:
             map_symbols_to_conds(pattern, clauses['define'], clauses['order_by'], symbol_seq)
+            
+    return new_query
+
+
+#####################################################
+# ************************************************* #
+#                                                   #
+#              BUCKETIZED PREFILTER                 #
+#                                                   #
+# ************************************************* #
+#####################################################
+
+def build_input_bucketized(
+    dataset_name: str,
+    order_by: str,
+    window: str
+    ) -> str:
+    
+    bucketized_input = "\n".join([
+            "WITH input_bucketized AS (",
+            f"\tSELECT *, cast({order_by} / {window} AS bigint) AS bk",
+            f"\tFROM {dataset_name}",
+            "),\n"])
+    
+    return bucketized_input
+
+def get_bucket_time_range(
+    symbol_seq: Sequence[str],
+    pattern: Sequence[str]
+) -> Tuple[str, str]:
+    # function from DEFINTION 3.10
+    bk_s = bk_e = None
+    if symbol_seq[0] == pattern[0] and symbol_seq[-1] == pattern[-1]:
+        bk_s = f"{symbol_seq[0]}.bk"
+        bk_e = f"{symbol_seq[-1]}.bk"
+    elif symbol_seq[-1] == pattern[-1]:
+        bk_s = f"{symbol_seq[-1]}.bk - 1"
+        bk_e = f"{symbol_seq[-1]}.bk"
+    elif symbol_seq[0] == pattern[0]:
+        bk_s = f"{symbol_seq[0]}.bk"
+        bk_e = f"{symbol_seq[0]}.bk + 1"
+    else:
+        bk_s = f"{symbol_seq[-1]}.bk - 1"
+        bk_e = f"{symbol_seq[0]}.bk + 1"
+    return bk_s, bk_e
+
+
+def build_bucketized_ranges(pattern: Sequence[str], symbol_seq: List[str], conds: List[str]) -> str:
+    
+    bk_s, bk_e = get_bucket_time_range(symbol_seq, pattern)
+    
+    sym_join = ", ".join(f"input_bucketized AS {sym}" for sym in symbol_seq)
+    
+    # all events in the same bucket
+    cond_same_bucket = [f"{symbol_seq[0]}.bk = {sym}.bk" for sym in symbol_seq[1:]]
+    bucketized_range1 = "\n".join([
+            "ranges AS (",
+            f"\tSELECT {bk_s} as bk_s, {bk_e} as bk_e",
+            f"\tFROM {sym_join}",
+            f"\tWHERE {"\n\t\tAND ".join(cond_same_bucket + conds)}"])
+    
+    # no union necessary for single event
+    if len(symbol_seq) == 1:
+        return bucketized_range1 + "\n),"
+    
+    # events can be spread between two consecutive buckets
+    cond_two_buckets = [f"{symbol_seq[0]}.bk + 1 = {symbol_seq[-1]}.bk"]
+    if len(symbol_seq) > 2:
+        for sym1, sym2 in zip(symbol_seq[:-1], symbol_seq[1:]):
+            cond_two_buckets.append(f"{sym1}.bk <= {sym2}.bk")
+    
+    bucketized_range2 = "\n".join([
+            f"\tSELECT {bk_s} as bk_s, {bk_e} as bk_e",
+            f"\tFROM {sym_join}",
+            f"\tWHERE {"\n\t\tAND ".join(cond_two_buckets + conds)}",
+            "),"])
+    
+    return "\n\tUNION\n".join([bucketized_range1, bucketized_range2])
+
+
+def build_buckets() -> str:
+    buckets = textwrap.dedent("""
+        buckets AS (
+        \tSELECT DISTINCT bk FROM ranges
+        \tCROSS JOIN UNNEST(sequence(ranges.bk_s, ranges.bk_e)) AS t(bk)
+        ), """)
+    return buckets
+
+
+def build_bucketized_prefilter() -> str:
+    prefilter = textwrap.dedent("""
+        prefilter AS (
+        \tSELECT i.* FROM input_bucketized AS i, buckets AS b
+        \tWHERE i.bk = b.bk
+        )\n""")
+    return prefilter
+
+
+def build_bucketized_query(input_bucketized: str, ranges: str, buckets: str, prefilter: str, full_mr: str) -> str:
+    final = f"SELECT * FROM prefilter MATCH_RECOGNIZE (\n\t{full_mr}\n)"
+    query = "".join([input_bucketized, ranges, buckets, prefilter, final])
+    return query
+
+
+def rewrite_bucketized(
+    clauses: MatchRecognizeClauses,
+    symbol_seq: List[str],
+    dataset_name: str,
+    full_mr: str
+    ) -> str:
+    
+    pattern_literals = list(flatten(clauses['pattern']))
+    pattern = "".join(pattern_literals)
+    
+    # special case: pattern only has Concatenation operator, e.g., (A B C D E)
+    if pattern.isalpha():
+        conds, window = map_symbols_to_conds(
+            pattern_literals,
+            clauses['define'],
+            clauses['order_by'][0],
+            symbol_seq,
+            "bucket"
+        )
+        
+        if not window:
+            raise ValueError("Bucketized Prefilter relies on the (missing) Pattern Window Condition")
+        
+        input_bucketized: str = build_input_bucketized(dataset_name, clauses['order_by'][0], window)
+        ranges: str = build_bucketized_ranges(pattern_literals, symbol_seq, conds)
+        buckets: str = build_buckets()
+        prefilter: str = build_bucketized_prefilter()
+        
+        new_query = build_bucketized_query(input_bucketized, ranges, buckets, prefilter, full_mr)
+    
+    return new_query
+
+
+def main(
+    rewrite: str = "basic",
+    query_path: str = "input/query.sql",
+    symbol_seq: List[str] = ['A', 'B']
+    ) -> None:
+    """rewrite basic/bucket"""
+    
+    with open(query_path) as f:
+        query = f.read()
+    full_mr = extract_full_mr(query)
+    dataset_name, mr_clauses = sql_to_clauses(query)
+    
+    #TODO split to general and special patterns here; same procedure regardless of rewrite
+    
+    if rewrite == "basic":   
+        new_query = rewrite_basic(mr_clauses, symbol_seq, dataset_name, full_mr) 
+    elif rewrite == "bucket":
+        new_query = rewrite_bucketized(mr_clauses, symbol_seq, dataset_name, full_mr)
+        
+    os.makedirs("results", exist_ok = True)
+    with open(f"results/{dataset_name}_{rewrite}_{"_".join(symbol_seq)}.sql", "w") as out:
+        out.write(new_query)
 
     
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1], sys.argv[2], sys.argv[3:])
