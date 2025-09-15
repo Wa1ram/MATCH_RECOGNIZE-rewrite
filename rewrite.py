@@ -1,5 +1,6 @@
 import os
 from helper.python_trino_parser import sql_to_clauses
+from helper.expand_pattern import expand
 import re
 import sys
 import textwrap
@@ -34,9 +35,31 @@ def extract_pattern_symbols(
     def_sym = set(clause[0] for clause in define)
     return all_sym, def_sym
 
-    
-def decompose_pattern(pattern: NestedStrList) -> List[Sequence[str]]:
-    pass    
+
+def _prompt_user_for_subsequences(special_patterns: Sequence[Sequence[str]]) -> List[str]:
+    """Print special patterns and ask user for a subsequence to use for prefilter.
+
+    Input format: space- or comma-separated symbols, e.g. "A B C" or "A,B,C".
+    Returns an upper-cased list of symbols that is a subsequence of at least one pattern.
+    """
+    subseqs: List[List[str]] = []
+
+    print("Discovered special patterns (choose a subsequence to drive the prefilter):")
+    for idx, pat in enumerate(special_patterns, 1):
+        print(f"  {idx:2d}: {' '.join(pat)}")
+
+    for pat in special_patterns:
+        raw = input(f"Enter subsequence for {pat} (e.g. '{pat[0]} {pat[-1]}' or '{pat[0]},{pat[-1]}'; if no input use example): ").strip()
+        if not raw:
+            subseqs.append([pat[0], pat[-1]])
+            continue
+        # Split by comma or whitespace
+        tokens = [t for t in re.split(r"[\s,]+", raw) if t]
+        subseq = [t.upper() for t in tokens]
+        subseqs.append(subseq)
+        
+    return subseqs
+        
     
     
 def build_window_condition_regex(first_sym: str, last_sym: str, order_by: str) -> Pattern[str]:
@@ -100,6 +123,15 @@ def add_symbol_prefix(cond: str, symbol: str) -> str:
     return cond
 
 
+def uses_only_allowed(cond: str, allowed: set[str]) -> bool:
+    """
+    Checks if a condition uses only symbols from the allowed set.
+    """
+    tokens = {part.split(".")[0] for part in cond.split() if "." in part}
+    # check if subset
+    return tokens <= allowed
+
+
 def map_symbols_to_conds(
     pattern: Sequence[str],
     define: Sequence[Tuple[str, Sequence[str]]],
@@ -128,7 +160,6 @@ def map_symbols_to_conds(
     window_pattern = build_window_condition_regex(pattern[0], pattern[-1], order_by)
     window_cond = None
     window: Optional[str] = None
-    non_seq_syms = set(pattern).difference(symbol_seq)
     
     # you can express window funcs through adjusting the pattern
     # eg. change    PATTERN (A)     DEFINE A AS price > PREV(price)
@@ -147,7 +178,7 @@ def map_symbols_to_conds(
                 continue
             
             # remove all conds that include symbols which are not in symbolseq
-            if any(f"{non_seq_sym}." in cond for non_seq_sym in non_seq_syms):
+            if not uses_only_allowed(cond, set(symbol_seq)):
                 continue
             
             # window functions are not allowed due to difficult translation (TODO)
@@ -208,7 +239,7 @@ def get_basic_time_range(
     order_by: str,
     window: Optional[str],
 ) -> Tuple[Optional[str], Optional[str]]:
-    # function from DEFINTION 3.7 (TODO might be incorrect for duplicates)
+    # function from DEFINTION 3.7 (TODO window unclear for general patterns and might be incorrect for duplicates)
     t_s = t_e = None
     if symbol_seq[0] == pattern[0] and symbol_seq[-1] == pattern[-1]:
         t_s = f"{symbol_seq[0]}.{order_by}"
@@ -225,7 +256,7 @@ def get_basic_time_range(
     return t_s, t_e
 
 
-def build_basic_ranges(
+def build_basic_ranges_sub(
     pattern: Sequence[str],
     symbol_seq: Sequence[str],
     order_by: str,
@@ -233,7 +264,7 @@ def build_basic_ranges(
     conds: Sequence[str],
     window: Optional[str],
 ) -> str:
-    """Create the ranges CTE based on a chosen symbol sequence and window."""
+    """Create one SELECT-clause for the ranges CTE based on a chosen symbol sequence and window."""
     t_s, t_e = get_basic_time_range(symbol_seq, pattern, order_by, window)
     if t_s is None or t_e is None:
         raise ValueError("Cannot compute time range: insufficient endpoints or window")
@@ -242,13 +273,15 @@ def build_basic_ranges(
     cond_str = "\n\t\tAND ".join(conds)
     
     ranges = "\n".join([
-            "WITH ranges AS (",
-            f"\tSELECT {t_s} as t_s, {t_e} as t_e",
+            f"\tSELECT {t_s} as t_s, {t_e} as t_e \t -- pattern: {pattern} subseq: {symbol_seq}",
             f"\tFROM {sym_join}",
-            f"\tWHERE {cond_str}"
-            "\n),"])
+            f"\tWHERE {cond_str}"])
             
     return ranges
+
+def build_basic_ranges(subs: List[str]) -> str:
+    joined_subs = "\n\n\tUNION\n\n".join(subs)
+    return "\n".join(["WITH ranges AS (", joined_subs, "),"])
 
 
 def build_basic_prefilter(dataset_name: str, order_by: str) -> str:
@@ -269,33 +302,29 @@ def build_basic_query(ranges: str, prefilter: str, full_mr: str) -> str:
 
 def rewrite_basic(
     clauses: MatchRecognizeClauses,
-    symbol_seq: List[str],
+    patterns: List[List[str]],
+    subseqs: List[List[str]],
     dataset_name: str,
     full_mr: str
     ) -> str:
     
-    pattern_literals = list(flatten(clauses['pattern']))
-    pattern = "".join(pattern_literals)
+    ranges_subs: List[str] = []
     
-    # special case: pattern only has Concatenation operator, e.g., (A B C D E)
-    if pattern.isalpha():
+    for special_pattern, subseq in zip(patterns, subseqs):
         conds, window = map_symbols_to_conds(
-            pattern_literals,
+            special_pattern,
             clauses['define'],
             clauses['order_by'][0],
-            symbol_seq,
+            subseq,
+            "basic"
         )
+        cte_sub = build_basic_ranges_sub(special_pattern, subseq, clauses['order_by'][0], dataset_name, conds, window)
+        ranges_subs.append(cte_sub)
         
-        ranges: str = build_basic_ranges(pattern_literals, symbol_seq, clauses['order_by'][0], dataset_name, conds, window)
-        prefilter: str = build_basic_prefilter(dataset_name, clauses['order_by'][0])
-        new_query: str = build_basic_query(ranges, prefilter, full_mr)
-        
-        
-    else:   
-        # decompose general pattern to special cases
-        special_patterns = decompose_pattern(clauses['pattern'])
-        for pattern in special_patterns:
-            map_symbols_to_conds(pattern, clauses['define'], clauses['order_by'], symbol_seq)
+    # union subqueries
+    ranges: str = build_basic_ranges(ranges_subs)
+    prefilter: str = build_basic_prefilter(dataset_name, clauses['order_by'][0])
+    new_query: str = build_basic_query(ranges, prefilter, full_mr)
             
     return new_query
 
@@ -435,8 +464,7 @@ def rewrite_bucketized(
 
 def main(
     rewrite: str = "basic",
-    query_path: str = "input/query.sql",
-    symbol_seq: List[str] = ['A', 'B']
+    query_path: str = "input/query.sql"
     ) -> None:
     """rewrite basic/bucket"""
     
@@ -445,18 +473,26 @@ def main(
     full_mr = extract_full_mr(query)
     dataset_name, mr_clauses = sql_to_clauses(query)
     
+    # expand pattern to only special patterns according to 3.1.2 in the paper
+    patterns: List[List[str]] = expand(mr_clauses['pattern'])
+    # ask the user to pick sub sequences for each special pattern
+    subseqs: List[List[str]] = _prompt_user_for_subsequences(patterns)
+    
     #TODO split to general and special patterns here; same procedure regardless of rewrite
+    # maybe dont give clauses and just give all relevant info -> may be too much and therefore unclear
     
     if rewrite == "basic":   
-        new_query = rewrite_basic(mr_clauses, symbol_seq, dataset_name, full_mr) 
+        new_query = rewrite_basic(mr_clauses, patterns, subseqs, dataset_name, full_mr) 
     elif rewrite == "bucket":
-        new_query = rewrite_bucketized(mr_clauses, symbol_seq, dataset_name, full_mr)
-        
+        new_query = rewrite_bucketized(mr_clauses, subseqs, dataset_name, full_mr)
+    
+    
     os.makedirs("results", exist_ok = True)
-    with open(f"results/{dataset_name}_{rewrite}_{"_".join(symbol_seq)}.sql", "w") as out:
+    with open(f"results/{dataset_name}_{rewrite}_{"_".join("".join(seq) for seq in subseqs)}.sql", "w") as out:
         out.write(new_query)
 
     
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2], sys.argv[3:])
+    args = sys.argv[1:]
+    main(*args)

@@ -1,4 +1,5 @@
 /venv
+__pycache__
 results/*
 !results/CRIMES_bucket_R_M.sql
 helper/__pycache__/python_trino_parser.cpython-312.pyc

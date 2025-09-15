@@ -228,7 +228,7 @@ if __name__ == "__main__":
             LAST(UP.ts)  AS end_ts
         ONE ROW PER MATCH
         AFTER MATCH SKIP PAST LAST ROW
-        PATTERN (A B C)
+        PATTERN (((a+ b?) | (C{2,3})) D* PERMUTE(E, F{2}))
         DEFINE
             B AS B.close > A.close
             AND B.ts - A.ts <= INTERVAL '7' DAY,   -- Window condition
@@ -403,3 +403,7 @@ if __name__ == "__main__":
             print(f"  {var} AS {expr}")
             print()
             print()
+[[['(', [['(', [['A', '*'], ['B', '+']], ')'], '|', ['D', ['{', ',', '4', '}']]], ')'], '?'], ['C', ['{', '3', ',', '5', '}']]]
+[[[['(', [['A', ['B', '+']], '|', ['C', ['{', '2', ',', '4', '}']]], ')'], '?'], ['D', '*']], ['PERMUTE', '(', 'E', ',', ['F', ['G', ['{', '3', '}']]], ')']]
+[['A', 'B'], 'C']
+[['A', [['(', ['B', '+'], ')'], '?']], 'C']
