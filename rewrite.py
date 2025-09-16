@@ -19,7 +19,7 @@ class MatchRecognizeClauses(TypedDict, total=False):
 
 
 def flatten(lst: Iterable[Any]) -> Iterator[Any]:
-    # Recursively flatten a nested list
+    """Recursively flatten a nested list."""
     for el in lst:
         if isinstance(el, list):
             yield from flatten(el)
@@ -27,13 +27,23 @@ def flatten(lst: Iterable[Any]) -> Iterator[Any]:
             yield el
 
 
-def extract_pattern_symbols(
-    pattern: NestedStrList,
-    define: Sequence[Tuple[str, Sequence[str]]],
-) -> Tuple[Set[str], Set[str]]:
-    all_sym = set(el for el in flatten(pattern) if el.isalpha() and el != 'PERMUTE')
-    def_sym = set(clause[0] for clause in define)
-    return all_sym, def_sym
+def filter_minimal_subseqs(
+    patterns: List[List[str]], subseqs: List[List[str]]
+) -> Tuple[List[List[str]], List[List[str]]]:
+    """
+    Filter (pattern, subseq) pairs so that only those remain
+    where the subseq is not a proper superset of another subseq.
+    Returns new (patterns, subseqs) lists.
+    """
+    keep_patterns, keep_subseqs = [], []
+    for pat, subseq in zip(patterns, subseqs):
+        if not any(
+            set(other).issubset(subseq) and set(other) != set(subseq)
+            for other in subseqs
+        ):
+            keep_patterns.append(pat)
+            keep_subseqs.append(subseq)
+    return keep_patterns, keep_subseqs
 
 
 def _prompt_user_for_subsequences(special_patterns: Sequence[Sequence[str]]) -> List[str]:
@@ -239,7 +249,8 @@ def get_basic_time_range(
     order_by: str,
     window: Optional[str],
 ) -> Tuple[Optional[str], Optional[str]]:
-    # function from DEFINTION 3.7 (TODO window unclear for general patterns and might be incorrect for duplicates)
+    """Compute [t_s, t_e] endpoints for the basic prefilter (per Definition 3.7)."""
+    #TODO window unclear for general patterns and might be incorrect for duplicates
     t_s = t_e = None
     if symbol_seq[0] == pattern[0] and symbol_seq[-1] == pattern[-1]:
         t_s = f"{symbol_seq[0]}.{order_by}"
@@ -280,11 +291,13 @@ def build_basic_ranges_sub(
     return ranges
 
 def build_basic_ranges(subs: List[str]) -> str:
+    """Combine multiple range SELECTs into the ranges CTE with UNIONs."""
     joined_subs = "\n\n\tUNION\n\n".join(subs)
     return "\n".join(["WITH ranges AS (", joined_subs, "),"])
 
 
 def build_basic_prefilter(dataset_name: str, order_by: str) -> str:
+    """CTE selecting distinct rows in the unioned time windows (ranges)."""
     prefilter = textwrap.dedent(f"""
         prefilter AS (
             SELECT DISTINCT {dataset_name}.* FROM {dataset_name}, ranges AS r
@@ -295,6 +308,7 @@ def build_basic_prefilter(dataset_name: str, order_by: str) -> str:
 
 
 def build_basic_query(ranges: str, prefilter: str, full_mr: str) -> str:
+    """Assemble the final query: ranges CTE + prefilter CTE + original MATCH_RECOGNIZE."""
     final = f"SELECT * FROM prefilter MATCH_RECOGNIZE (\n\t{full_mr}\n)"
     query = "".join([ranges, prefilter, final])
     return query
@@ -307,6 +321,7 @@ def rewrite_basic(
     dataset_name: str,
     full_mr: str
     ) -> str:
+    """Rewrite using the basic prefilter by UNION-ing per-subsequence ranges."""
     
     ranges_subs: List[str] = []
     
@@ -342,6 +357,7 @@ def build_input_bucketized(
     order_by: str,
     window: str
     ) -> str:
+    """CTE that adds a bucket column (bk) by dividing order_by by window."""
     
     bucketized_input = "\n".join([
             "WITH input_bucketized AS (",
@@ -355,7 +371,7 @@ def get_bucket_time_range(
     symbol_seq: Sequence[str],
     pattern: Sequence[str]
 ) -> Tuple[str, str]:
-    # function from DEFINTION 3.10
+    """Compute [bk_s, bk_e] for buckets prefilter (Definition 3.10)."""
     bk_s = bk_e = None
     if symbol_seq[0] == pattern[0] and symbol_seq[-1] == pattern[-1]:
         bk_s = f"{symbol_seq[0]}.bk"
@@ -372,23 +388,24 @@ def get_bucket_time_range(
     return bk_s, bk_e
 
 
-def build_bucketized_ranges(pattern: Sequence[str], symbol_seq: List[str], conds: List[str]) -> str:
+def build_bucketized_ranges_sub(pattern: Sequence[str], symbol_seq: List[str], conds: List[str]) -> str:
+    """Create SELECT-clause(s) for a special pattern symseq pair to be included in the ranges CTE."""
     
     bk_s, bk_e = get_bucket_time_range(symbol_seq, pattern)
     
+    # eg. input_bucketized AS R, input_bucketized AS M
     sym_join = ", ".join(f"input_bucketized AS {sym}" for sym in symbol_seq)
     
     # all events in the same bucket
     cond_same_bucket = [f"{symbol_seq[0]}.bk = {sym}.bk" for sym in symbol_seq[1:]]
     bucketized_range1 = "\n".join([
-            "ranges AS (",
-            f"\tSELECT {bk_s} as bk_s, {bk_e} as bk_e",
+            f"\tSELECT {bk_s} as bk_s, {bk_e} as bk_e \t -- pattern: {pattern} ",
             f"\tFROM {sym_join}",
             f"\tWHERE {"\n\t\tAND ".join(cond_same_bucket + conds)}"])
     
     # no union necessary for single event
     if len(symbol_seq) == 1:
-        return bucketized_range1 + "\n),"
+        return bucketized_range1
     
     # events can be spread between two consecutive buckets
     cond_two_buckets = [f"{symbol_seq[0]}.bk + 1 = {symbol_seq[-1]}.bk"]
@@ -399,13 +416,19 @@ def build_bucketized_ranges(pattern: Sequence[str], symbol_seq: List[str], conds
     bucketized_range2 = "\n".join([
             f"\tSELECT {bk_s} as bk_s, {bk_e} as bk_e",
             f"\tFROM {sym_join}",
-            f"\tWHERE {"\n\t\tAND ".join(cond_two_buckets + conds)}",
-            "),"])
+            f"\tWHERE {"\n\t\tAND ".join(cond_two_buckets + conds)}"])
     
     return "\n\tUNION\n".join([bucketized_range1, bucketized_range2])
 
 
+def build_bucketized_ranges(subs: List[str]) -> str:
+    """Combine multiple range SELECTs into the ranges CTE with UNIONs."""
+    joined_subs = "\n\n\tUNION\n\n".join(subs)
+    return "\n".join(["ranges AS (", joined_subs, "),"])
+
+
 def build_buckets() -> str:
+    """CTE enumerating all buckets between bk_s and bk_e for each range."""
     buckets = textwrap.dedent("""
         buckets AS (
         \tSELECT DISTINCT bk FROM ranges
@@ -415,6 +438,7 @@ def build_buckets() -> str:
 
 
 def build_bucketized_prefilter() -> str:
+    """CTE selecting rows from input_bucketized that fall into selected buckets."""
     prefilter = textwrap.dedent("""
         prefilter AS (
         \tSELECT i.* FROM input_bucketized AS i, buckets AS b
@@ -424,6 +448,7 @@ def build_bucketized_prefilter() -> str:
 
 
 def build_bucketized_query(input_bucketized: str, ranges: str, buckets: str, prefilter: str, full_mr: str) -> str:
+    """Assemble query for bucketized prefilter mode."""
     final = f"SELECT * FROM prefilter MATCH_RECOGNIZE (\n\t{full_mr}\n)"
     query = "".join([input_bucketized, ranges, buckets, prefilter, final])
     return query
@@ -431,40 +456,54 @@ def build_bucketized_query(input_bucketized: str, ranges: str, buckets: str, pre
 
 def rewrite_bucketized(
     clauses: MatchRecognizeClauses,
-    symbol_seq: List[str],
+    patterns: List[List[str]],
+    subseqs: List[List[str]],
     dataset_name: str,
     full_mr: str
     ) -> str:
+    """Rewrite using bucketized prefilter (requires a detected pattern window)."""
+
+    #TODO separate workflow for different pattern window conditions, eg. (A|B)C has to have 2 pattern window conditions
+    # different special patterns can have the same window -> can be unioned in ranges and used in same prefilter
+    ranges_subs: List[str] = []
+    seen_windows: set[str] = set()
     
-    pattern_literals = list(flatten(clauses['pattern']))
-    pattern = "".join(pattern_literals)
-    
-    # special case: pattern only has Concatenation operator, e.g., (A B C D E)
-    if pattern.isalpha():
+    for special_pattern, subseq in zip(patterns, subseqs):
         conds, window = map_symbols_to_conds(
-            pattern_literals,
+            special_pattern,
             clauses['define'],
             clauses['order_by'][0],
-            symbol_seq,
+            subseq,
             "bucket"
         )
         
+        sub = build_bucketized_ranges_sub(special_pattern, subseq, conds)
+        ranges_subs.append(sub)
+        
         if not window:
-            raise ValueError("Bucketized Prefilter relies on the (missing) Pattern Window Condition")
+            continue
+            #raise ValueError(f"There is no pattern window condition between {special_pattern[0]} and {special_pattern[-1]} for pattern {special_pattern}.")
         
-        input_bucketized: str = build_input_bucketized(dataset_name, clauses['order_by'][0], window)
-        ranges: str = build_bucketized_ranges(pattern_literals, symbol_seq, conds)
-        buckets: str = build_buckets()
-        prefilter: str = build_bucketized_prefilter()
+        seen_windows.add(window)
+    
+    if len(seen_windows)==0:
+        raise ValueError(f"No pattern window condition found.")
+   
+    window = seen_windows.pop()
         
-        new_query = build_bucketized_query(input_bucketized, ranges, buckets, prefilter, full_mr)
+    input_bucketized: str = build_input_bucketized(dataset_name, clauses['order_by'][0], window)
+    ranges: str = build_bucketized_ranges(ranges_subs)
+    buckets: str = build_buckets()
+    prefilter: str = build_bucketized_prefilter()
+    
+    new_query = build_bucketized_query(input_bucketized, ranges, buckets, prefilter, full_mr)
     
     return new_query
 
 
 def main(
-    rewrite: str = "basic",
-    query_path: str = "input/query.sql"
+    rewrite: str = "bucket",
+    query_path: str = "results/PRICES_bucket_ACD_BCD.sql"
     ) -> None:
     """rewrite basic/bucket"""
     
@@ -478,13 +517,12 @@ def main(
     # ask the user to pick sub sequences for each special pattern
     subseqs: List[List[str]] = _prompt_user_for_subsequences(patterns)
     
-    #TODO split to general and special patterns here; same procedure regardless of rewrite
-    # maybe dont give clauses and just give all relevant info -> may be too much and therefore unclear
+    patterns, subseqs = filter_minimal_subseqs(patterns, subseqs)
     
     if rewrite == "basic":   
         new_query = rewrite_basic(mr_clauses, patterns, subseqs, dataset_name, full_mr) 
     elif rewrite == "bucket":
-        new_query = rewrite_bucketized(mr_clauses, subseqs, dataset_name, full_mr)
+        new_query = rewrite_bucketized(mr_clauses, patterns, subseqs, dataset_name, full_mr)
     
     
     os.makedirs("results", exist_ok = True)
